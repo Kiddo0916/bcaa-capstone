@@ -1,104 +1,84 @@
+[README.md](https://github.com/user-attachments/files/34773509/README.md)
 # BCAA Serverless Image Processing Capstone
 
 Brian DeJesus, Craig Mejorada, and Antoine Meknonnen
 
-Upload a JPEG, PNG, or WebP to the originals bucket. S3 calls the resize
-Lambda, which fits the image inside 256 × 256 pixels and preserves the
-aspect ratio, file format, and object key. Small images stay at their
-original dimensions. Both buckets block public access.
+This project creates thumbnails from images stored in Amazon S3. Uploading a JPEG, PNG, or WebP to the originals bucket automatically invokes Lambda. You can also send an image key to API Gateway to resize a file already in that bucket. The thumbnail keeps the original format and object key and fits inside 256 × 256 pixels without stretching or enlarging the image.
+
+## Architecture
 
 ```mermaid
 flowchart TD
-    Original["Original images (S3)"] -->|Object created| Lambda["Resize image (Lambda)"]
-    API["POST /resize (API Gateway)"] -->|StartExecution| Workflow["Image workflow (Step Functions)"]
+    Original["S3 originals bucket"] -->|Object created| Lambda["Lambda resize function"]
+    API["API Gateway POST /resize"] -->|StartExecution| Workflow["Step Functions workflow"]
     Workflow -->|Invoke| Lambda
-    Lambda --> Resized["Resized images (S3)"]
-    Lambda -->|Logs| Logs["CloudWatch Logs"]
+    Lambda -->|Write thumbnail| Resized["S3 resized bucket"]
+    Lambda -->|Processing logs| Logs["CloudWatch Logs"]
 ```
 
-The upload calls Lambda directly. The API starts a Standard Step Functions
-execution, which calls the same Lambda and branches to success or failure.
-The API responds with an execution ARN while the workflow runs.
+The Standard workflow invokes Lambda in `ResizeImage`. The `CheckResult` choice checks `Payload.success` and routes to `ResizeSucceeded` or `ResizeFailed`. The task also catches Lambda errors and sends them to `ResizeFailed`.
 
-## Deploy
+## Deployed resources
 
-Install AWS CLI, AWS SAM CLI, and Docker. Start Docker, authenticate the AWS
-CLI to the capstone account, and choose a region available to your AWS role.
-If your course uses a lab account, confirm it permits CloudFormation to
-create the service roles required by the template.
+| Resource | Value |
+| --- | --- |
+| Region | US East (Ohio), `us-east-2` |
+| Originals bucket | `bcaa-capstone-original-images` |
+| Resized bucket | `bcaa-capstone-resized-images` |
+| Lambda function | `bcaa-capstone-resize-image` |
+| Pillow layer | `bcaa-capstone-pillow` |
+| State machine ARN | `arn:aws:states:us-east-2:148142121599:stateMachine:bcaa-capstone-image-workflow` |
+| Deployed API route | `POST https://cicaaxmu00.execute-api.us-east-2.amazonaws.com/capstone/resize` |
+
+## AWS Console setup
+
+You need an AWS account with permission to create the listed resources and their IAM roles. To build the two ZIPs on Windows, use PowerShell with Python and pip.
+
+1. Create the two S3 general purpose buckets in `us-east-2` with **Block all public access** enabled.
+2. From the repository root, package the Lambda source and Pillow 12.2.0 layer.
+
+   ```powershell
+   Compress-Archive -Path .\src\resize.py -DestinationPath .\bcaa-resize-code.zip -Force
+   py -m pip install --platform manylinux2014_x86_64 --python-version 3.12 --only-binary=:all: --target .\python -r .\layer\requirements.txt
+   Compress-Archive -Path .\python -DestinationPath .\bcaa-pillow-layer.zip -Force
+   ```
+
+3. Create the Lambda function with **Python 3.12**, **x86_64**, **512 MB** memory, and a **30-second** timeout. Upload the code ZIP and set the handler to `resize.handler`. Publish the layer ZIP for Python 3.12 and x86_64, then attach the layer.
+4. Set `ORIGINAL_BUCKET` to `bcaa-capstone-original-images` and `RESIZED_BUCKET` to `bcaa-capstone-resized-images`. Give the Lambda execution role CloudWatch Logs access, `s3:GetObject` on the originals bucket's objects, and `s3:PutObject` on the resized bucket's objects. Add an S3 trigger on the originals bucket for **All object create events**.
+5. Create a **Standard** state machine using [workflow/resize.asl.json](workflow/resize.asl.json). For another deployment, replace its Lambda ARN with your function ARN. Give the Step Functions execution role permission to invoke that function.
+6. Create a **Regional REST API** with `POST /resize`. Use an **AWS service** integration for **Step Functions** in `us-east-2`, with integration method `POST` and action name `StartExecution`. Use an execution role trusted by `apigateway.amazonaws.com` with `states:StartExecution` on this state machine.
+7. Set request body passthrough to **Never** and add this `application/json` integration request template. Substitute your state machine ARN when recreating the setup.
+
+   ```velocity
+   {
+     "input": "$util.escapeJavaScript($input.body).replaceAll("\\'","'")",
+     "stateMachineArn": "arn:aws:states:us-east-2:148142121599:stateMachine:bcaa-capstone-image-workflow"
+   }
+   ```
+
+8. Set the method authorization to **AWS_IAM** and deploy to the `capstone` stage.
+
+## Test the pipeline
+
+### Automatic S3 upload
+
+Upload a fresh JPEG larger than 256 pixels on its longest side to the originals bucket. Refresh the resized bucket and download the object with the same key. In our test, a 4320 × 3240 photo produced a 256 × 192 thumbnail. Lambda logs are available under `/aws/lambda/bcaa-capstone-resize-image` in CloudWatch Logs.
+
+### Deployed API
+
+With `demo.jpg` in the originals bucket, open **AWS CloudShell**. Your AWS identity needs `execute-api:Invoke` for the route. Run the signed request below.
 
 ```bash
-export AWS_DEFAULT_REGION=us-east-1  # Change this if your lab specifies a region.
-aws sts get-caller-identity
-sam validate
-sam build --use-container
-sam deploy --stack-name bcaa-capstone --resolve-s3 --capabilities CAPABILITY_IAM
+(
+  signing_env="$(aws configure export-credentials --format env)" || exit 1
+  eval "$signing_env"
+  curl -sS -i --aws-sigv4 'aws:amz:us-east-2:execute-api' \
+    --user "$AWS_ACCESS_KEY_ID:$AWS_SECRET_ACCESS_KEY" \
+    -H "X-Amz-Security-Token: ${AWS_SESSION_TOKEN:-}" \
+    -H 'Content-Type: application/json' \
+    --data '{"key":"demo.jpg"}' \
+    'https://cicaaxmu00.execute-api.us-east-2.amazonaws.com/capstone/resize'
+)
 ```
 
-SAM builds the Pillow layer for Python 3.12 on x86-64. The two exact bucket
-names must be available in the AWS partition. If a previous deployment
-retained either bucket, check its ownership and stack history before
-redeploying. Use the CloudFormation outputs for the live API URL and
-state machine ARN.
-
-```bash
-aws cloudformation describe-stacks --stack-name bcaa-capstone \
-  --query 'Stacks[0].Outputs' --output table
-```
-
-## Test automatic upload
-
-Choose a JPEG larger than 256 pixels on at least one side.
-
-```bash
-aws s3 cp ./demo.jpg s3://bcaa-capstone-original-images/demo.jpg
-aws s3 ls s3://bcaa-capstone-resized-images/demo.jpg
-aws s3 cp s3://bcaa-capstone-resized-images/demo.jpg ./thumbnail.jpg
-```
-
-Allow a few seconds for the event to arrive. Open the downloaded thumbnail
-and check that its longest side is 256 pixels and its proportions match the
-original. Look for the processing message in `/aws/lambda/bcaa-capstone-resize-image`
-in CloudWatch Logs.
-
-## Test API Gateway and Step Functions
-
-The deployed route uses AWS IAM authentication. To test the integration
-through the console, open API Gateway, select `bcaa-capstone-image-api`,
-then **Resources → /resize → POST → Test**. Send this JSON body with
-`Content-Type: application/json`.
-
-```json
-{"key":"demo.jpg"}
-```
-
-To call the deployed URL, sign the same POST request with SigV4 for the
-`execute-api` service in the deployment region, using an AWS principal
-with `execute-api:Invoke` on the route. Use the `ResizeApiUrl` stack output.
-
-Copy the returned `executionArn`. Verify the workflow reached
-`ResizeSucceeded` and inspect the thumbnail dimensions in its output.
-
-```bash
-aws stepfunctions describe-execution --execution-arn '<executionArn>' \
-  --query '{Status:status,Output:output,Error:error}' --output json
-```
-
-Repeat with a missing key such as `missing.jpg` and verify that the
-execution fails. For a clean API demonstration, remove the demo thumbnail
-from the output bucket after the upload test and before calling the API.
-The API should recreate it from the original.
-
-## Submission
-
-Push the source, workflow definition, template, and README to your team's
-GitHub repository. Add the deployed API URL and workflow ARN to the
-course submission or private team README. Record a short video showing
-the original upload, its thumbnail in the resized bucket, the API test,
-and the resulting Step Functions execution.
-
-## Cleanup
-
-Deleting the stack removes the application resources while retaining
-the original and resized buckets and their contents. Manage those two
-buckets separately when the team has finished with the project.
+A successful request returns HTTP 200 and an `executionArn`. Find that execution in Step Functions and confirm it reached `ResizeSucceeded`. The execution output shows the resized bucket, key, width, and height. To test failure handling, start a workflow execution with `{"key":"missing.jpg"}` and confirm it reaches `ResizeFailed`.
