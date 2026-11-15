@@ -1,7 +1,6 @@
 [README.md](https://github.com/user-attachments/files/34773509/README.md)
 # BCAA Serverless Image Processing Capstone
 
-Brian DeJesus, Craig Mejorada, and Antoine Meknonnen
 
 This project creates thumbnails from images stored in Amazon S3. Uploading a JPEG, PNG, or WebP to the originals bucket automatically invokes Lambda. You can also send an image key to API Gateway to resize a file already in that bucket. The thumbnail keeps the original format and object key and fits inside 256 × 256 pixels without stretching or enlarging the image.
 
